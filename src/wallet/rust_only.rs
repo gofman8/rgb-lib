@@ -375,7 +375,9 @@ impl Wallet {
                     vout += 1;
                 }
                 sending_amt += amount;
-                if vout as usize > psbt.outputs.len() {
+                // Audit [25]: outputs are 0-indexed, so a vout EQUAL to the count is already out of
+                // range — use >= (the previous `>` accepted vout == outputs.len()).
+                if vout as usize >= psbt.outputs.len() {
                     return Err(Error::InvalidColoringInfo {
                         details: s!("invalid vout in output_map, does not exist in the given PSBT"),
                     });
