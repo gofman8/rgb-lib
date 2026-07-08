@@ -1707,7 +1707,15 @@ pub trait WalletOffline: WalletBackup {
             valid_transfer,
         )?;
 
-        let _ = self.add_asset_to_db(txn, &local_asset_data)?;
+        // Idempotent on an already-known asset: a wallet can receive a SECOND, separate allocation
+        // of an asset it already holds. The contract and the new transitions were already imported
+        // into the RGB runtime by the caller (save_new_asset -> import_contract); re-inserting the
+        // asset-metadata row would hit the UNIQUE constraint on asset.id and fail the whole accept
+        // (stranding the new allocation). Only insert the metadata on FIRST sight; the new coloring
+        // is registered separately by the receiver flow.
+        if txn.get_asset(local_asset_data.asset_id.clone())?.is_none() {
+            let _ = self.add_asset_to_db(txn, &local_asset_data)?;
+        }
 
         Ok(local_asset_data)
     }
