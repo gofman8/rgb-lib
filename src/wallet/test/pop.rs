@@ -168,6 +168,102 @@ fn pop_tampered_package_is_rejected() {
     ));
 }
 
+/// Full deployment-shape E2E: a real `pop-node` process (spawned from the
+/// binary given via `POP_NODE_BIN`), its timed heartbeat sealing entries, and
+/// two regtest wallets driving the flow over HTTP.
+///
+/// Run with:
+/// `POP_NODE_BIN=/path/to/pop-node cargo test --features pop pop_http_node_regtest_flow`
+#[test]
+fn pop_http_node_regtest_flow() {
+    let Ok(node_bin) = std::env::var("POP_NODE_BIN") else {
+        println!("POP_NODE_BIN not set, skipping HTTP node E2E");
+        return;
+    };
+    let data_dir = std::env::temp_dir().join(format!("pop-node-rgb-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let bind = "127.0.0.1:39950";
+
+    struct NodeGuard(std::process::Child);
+    impl Drop for NodeGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+        }
+    }
+    let _node = NodeGuard(
+        std::process::Command::new(&node_bin)
+            .args([
+                "--bind",
+                bind,
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+                "--name",
+                "rgb-lib-regtest-e2e",
+                "--close-interval",
+                "1",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn pop-node"),
+    );
+
+    let client = pop_client::HttpClient::new(&format!("http://{bind}"));
+    // wait for the node to come up
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while client.info().is_err() {
+        assert!(std::time::Instant::now() < deadline, "pop-node did not start");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // regtest wallets (get_test_wallet uses BitcoinNetwork::Regtest)
+    let sender = get_test_wallet(true, None);
+    let receiver = get_test_wallet(true, None);
+
+    let asset = sender
+        .pop_issue_asset(&client, s!("Regtest HTTP Coin"), s!("RHC"), 0, vec![250])
+        .unwrap();
+    let receive_data = receiver.pop_blind_receive(&client).unwrap();
+    let send_result = sender
+        .pop_send(&client, &receive_data.invoice, &asset.asset_id, 100)
+        .unwrap();
+
+    // the node's own heartbeat (1s interval) seals the entry — poll for the
+    // witness instead of closing manually
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let package = loop {
+        match sender.pop_get_transfer_package(&client, &send_result.transfer_id) {
+            Ok(package) => break package,
+            Err(_) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "entry was never sealed by the heartbeat"
+                );
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        }
+    };
+
+    let received = receiver.pop_accept_transfer(&package).unwrap();
+    assert_eq!(received.amount, 100);
+    assert_eq!(
+        sender.pop_get_asset_balance(&asset.asset_id).unwrap().settled,
+        150
+    );
+    assert_eq!(
+        receiver
+            .pop_get_asset_balance(&asset.asset_id)
+            .unwrap()
+            .settled,
+        100
+    );
+    println!(
+        "HTTP regtest flow OK: issued 250, sent 100 over pop-node at {bind}, change 150"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
 #[test]
 fn pop_invoice_roundtrip_and_wrong_ledger() {
     let (sender, receiver, ledger) = pop_wallets_and_ledger();
