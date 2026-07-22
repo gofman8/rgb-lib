@@ -136,7 +136,7 @@ features = ["rustls"]
 
 [features]
 default = ["electrum"]
-all = ["electrum", "esplora", "vss"]
+all = ["electrum", "esplora", "vss", "pop"]
 electrum = [
     "bdk_electrum",
     "reqwest",

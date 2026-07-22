@@ -25,6 +25,9 @@
 
 use super::*;
 
+// Imported directly (not via the electrum-gated re-export in lib.rs) so the
+// `pop` feature stands alone without electrum/esplora.
+use base64::{engine::general_purpose, Engine as _};
 use pop_client::PopClient;
 use pop_core::secp256k1::{All, Keypair, Message, Secp256k1, XOnlyPublicKey};
 use pop_core::{
@@ -527,17 +530,10 @@ impl Wallet {
             }
         }
         if input_sum < amount {
-            #[cfg(any(feature = "electrum", feature = "esplora"))]
-            return Err(Error::InsufficientAssignments {
-                asset_id: asset_id.to_string(),
-                available: AssignmentsCollection {
-                    fungible: input_sum,
-                    ..Default::default()
-                },
-            });
-            #[cfg(not(any(feature = "electrum", feature = "esplora")))]
+            // pop uses its own error type so the feature never depends on the
+            // electrum-gated `InsufficientAssignments` variant
             return Err(pop_err(format!(
-                "insufficient assignments: available {input_sum}, needed {amount}"
+                "insufficient assignments for asset {asset_id}: available {input_sum}, needed {amount}"
             )));
         }
 

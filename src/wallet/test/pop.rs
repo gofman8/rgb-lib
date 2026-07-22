@@ -107,7 +107,7 @@ fn pop_double_spend_is_prevented() {
     let invoice2 = receiver.pop_blind_receive(&ledger).unwrap();
     assert!(matches!(
         sender.pop_send(&ledger, &invoice2.invoice, &asset.asset_id, 100),
-        Err(Error::InsufficientAssignments { .. })
+        Err(Error::Pop { .. })
     ));
 
     // ledger-level: even signing a second closure manually is rejected,
