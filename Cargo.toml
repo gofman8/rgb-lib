@@ -81,6 +81,10 @@ zip = { version = "8.4.0", default-features = false, features = [
     "zstd",
 ] }
 
+# PoP seals (optional): proof-of-publication ledger as the single-use-seal medium
+pop-core = { git = "https://github.com/gofman8/pop-ledger", optional = true }
+pop-client = { git = "https://github.com/gofman8/pop-ledger", optional = true }
+
 # VSS backup (optional)
 vss-client = { package = "vss-client-ng", git = "https://github.com/lightningdevkit/vss-client", rev = "ad63805047561dcf3117cd992ad6d8bc3881adef", default-features = false, optional = true, features = [
     "sigs-auth",
@@ -145,6 +149,7 @@ esplora = [
 ]
 vss = ["vss-client", "hkdf", "dep:sha2"]
 mpc = []
+pop = ["dep:pop-core", "dep:pop-client"]
 dfns = ["mpc", "dep:p256", "dep:ed25519-dalek", "dep:sha2"]
 camel_case = ["default"]
 

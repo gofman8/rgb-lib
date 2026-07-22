@@ -34,6 +34,13 @@ pub enum Error {
     #[error("Bitcoin network mismatch")]
     BitcoinNetworkMismatch,
 
+    /// A PoP (proof-of-publication) seal operation failed
+    #[error("PoP operation failed: {details}")]
+    Pop {
+        /// Error details
+        details: String,
+    },
+
     /// A wallet cannot go online twice with different data
     #[error("Cannot change online object")]
     CannotChangeOnline,

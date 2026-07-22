@@ -15,6 +15,8 @@ pub(crate) mod objects;
 pub(crate) mod offline;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 pub(crate) mod online;
+#[cfg(feature = "pop")]
+pub mod pop;
 pub mod rust_only;
 pub(crate) mod singlesig;
 #[cfg(feature = "vss")]
