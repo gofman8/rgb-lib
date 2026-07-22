@@ -4,7 +4,7 @@
 //! Bitcoin transaction outputs but entries of a **proof-of-publication
 //! ledger** (Peter Todd, *Scalable Semi-Trustless Asset Transfer via
 //! Single-Use-Seals and Proof-of-Publication*, 2017), as implemented by the
-//! [`pop-ledger`](https://github.com/gofman8/pop-ledger) crates.
+//! [`scv-pop`](https://github.com/gofman8/scv-pop) crates.
 //!
 //! A seal is a `(ledger position, pubkey)` tuple; transferring an asset
 //! closes the sender's seal(s) by publishing a BIP340 signature over the
@@ -28,8 +28,8 @@ use super::*;
 use pop_client::PopClient;
 use pop_core::secp256k1::{All, Keypair, Message, Secp256k1, XOnlyPublicKey};
 use pop_core::{
-    AssetGenesis, InputRef, Output, Publication, SealDef, TokenProof, TransferBody, TransferStep,
-    H32,
+    verify_anchor_chain, AssetGenesis, InputRef, Output, Publication, RevealedOutput, SealDef,
+    TokenProof, TransferBody, TransferStep, H32,
 };
 
 /// File inside the wallet directory holding the PoP state.
@@ -124,6 +124,19 @@ pub struct PopReceivedTransfer {
     pub amount: u64,
 }
 
+/// Result of [`Wallet::pop_verify_anchors`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct PopAnchorStatus {
+    /// How many sealed entries are committed into Bitcoin
+    pub anchored_entries: u64,
+    /// The ledger's genesis seal outpoint (`None` = anchoring off)
+    pub genesis_seal: Option<String>,
+    /// Anchor transaction ids, in entry order — check their confirmation
+    /// depth against a Bitcoin view of choice
+    pub anchor_txids: Vec<String>,
+}
+
 /// Status of the ledger the wallet is bound to.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
@@ -199,6 +212,9 @@ struct PendingReceive {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct PendingSend {
     body: TransferBody,
+    /// Merkle-sum reveal proofs for the body's outputs (recipient at index
+    /// 0, change at index 1 when present).
+    reveals: Vec<RevealedOutput>,
     /// Steps merged from the spent coins' proofs (deduped, topological),
     /// without the new step (which needs the closure witnesses).
     prior_steps: Vec<TransferStep>,
@@ -275,11 +291,16 @@ impl Wallet {
         let key_index = store.next_key_index;
         store.next_key_index += 1;
         let keypair = self.pop_derive_keypair(secp, key_index)?;
+        let nonce = pop_core::tagged_hash(
+            "rgb-lib/pop/seal-nonce",
+            &keypair.secret_key().secret_bytes(),
+        );
         Ok((
             key_index,
             SealDef {
                 pubkey: keypair.x_only_public_key().0,
                 defined_at: next_index,
+                nonce,
             },
         ))
     }
@@ -310,14 +331,27 @@ impl Wallet {
     }
 
     /// Merge the steps of several proofs, deduplicating by body hash while
-    /// preserving topological order.
+    /// preserving topological order; steps for the same body get their
+    /// revealed outputs unioned (different proofs may reveal different
+    /// outputs of one transfer).
     fn pop_merge_steps(proofs: &[&TokenProof]) -> Vec<TransferStep> {
-        let mut seen: HashSet<H32> = HashSet::new();
-        let mut merged = Vec::new();
+        let mut index_of: HashMap<H32, usize> = HashMap::new();
+        let mut merged: Vec<TransferStep> = Vec::new();
         for proof in proofs {
             for step in &proof.steps {
-                if seen.insert(step.body.msg_hash()) {
-                    merged.push(step.clone());
+                let hash = step.body.msg_hash();
+                match index_of.get(&hash) {
+                    None => {
+                        index_of.insert(hash, merged.len());
+                        merged.push(step.clone());
+                    }
+                    Some(&i) => {
+                        for reveal in &step.revealed {
+                            if !merged[i].revealed.iter().any(|r| r.vout == reveal.vout) {
+                                merged[i].revealed.push(reveal.clone());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -522,15 +556,9 @@ impl Wallet {
                 amount: change,
             });
         }
-        let body = TransferBody {
-            asset_id,
-            inputs: selected
-                .iter()
-                .map(|&i| store.coins[i].source)
-                .collect(),
-            outputs,
-            rgb_commitment: None,
-        };
+        let inputs: Vec<InputRef> = selected.iter().map(|&i| store.coins[i].source).collect();
+        let (body, reveals) = TransferBody::build(asset_id, inputs, &outputs, None)
+            .ok_or_else(|| pop_err("transfer outputs overflow"))?;
         let msg = body.msg_hash();
 
         // sign the body with every input seal key, then publish the closures;
@@ -542,6 +570,7 @@ impl Wallet {
             let sig = secp.sign_schnorr(&Message::from_digest(*msg.as_bytes()), &keypair);
             publications.push(Publication {
                 pubkey: coin.output.seal.pubkey,
+                nonce: coin.output.seal.nonce,
                 msg_hash: msg,
                 sig,
             });
@@ -553,6 +582,7 @@ impl Wallet {
         }
         store.pending_sends.push(PendingSend {
             body,
+            reveals,
             prior_steps,
             genesis,
             change_key_index,
@@ -606,7 +636,7 @@ impl Wallet {
                 .find(|c| c.source == *input)
                 .ok_or_else(|| pop_err("corrupt PoP state: missing input coin"))?;
             let witness = client
-                .find_witness(&coin.output.seal.pubkey, coin.output.seal.defined_at)
+                .find_witness(&coin.output.seal)
                 .map_err(pop_err)?
                 .ok_or_else(|| {
                     pop_err("entry not sealed yet — retry after the ledger's next heartbeat")
@@ -614,10 +644,13 @@ impl Wallet {
             closes.push(witness);
         }
 
+        // the recipient's package reveals ONLY their output (vout 0); the
+        // change output stays private to this wallet
         let mut steps = pending.prior_steps.clone();
         steps.push(TransferStep {
             body: pending.body.clone(),
             closes,
+            revealed: vec![pending.reveals[0].clone()],
         });
         let proof = TokenProof {
             genesis: pending.genesis.clone(),
@@ -631,22 +664,23 @@ impl Wallet {
         pop_core::verify_token_proof(&secp, &operator_pubkey, &proof)
             .map_err(|e| pop_err(format!("assembled package fails validation: {e}")))?;
 
-        // materialize the change coin
+        // materialize the change coin, with its own reveal in its proof
         if let Some(change_key_index) = pending.change_key_index {
             let change_target = InputRef {
                 source: transfer_id,
                 vout: 1,
             };
-            let change_proof = TokenProof {
-                target: change_target,
-                ..proof.clone()
-            };
+            let mut change_proof = proof.clone();
+            change_proof.target = change_target;
+            change_proof.steps.last_mut().expect("just pushed").revealed =
+                vec![pending.reveals[1].clone()];
+            let change_output = pending.reveals[1].output;
             pop_core::verify_token_proof(&secp, &operator_pubkey, &change_proof)
                 .map_err(|e| pop_err(format!("change proof fails validation: {e}")))?;
             store.coins.push(StoredCoin {
                 asset_id: pending.body.asset_id,
                 source: change_target,
-                output: pending.body.outputs[1],
+                output: change_output,
                 key_index: change_key_index,
                 proof: change_proof,
                 spent: false,
@@ -747,6 +781,54 @@ impl Wallet {
             .collect())
     }
 
+    /// Verify the ledger's Bitcoin anchoring: fetch the anchor chain and
+    /// structurally verify that every anchored entry's header is committed
+    /// by a transaction spending the previous ledger seal (rewriting any
+    /// anchored entry would require double-spending Bitcoin).
+    ///
+    /// Returns the number of anchored entries (0 when the ledger runs
+    /// unanchored) and the anchor txids so callers can check confirmation
+    /// depth against their own Bitcoin view (e.g. the wallet's indexer).
+    pub fn pop_verify_anchors(&self, client: &dyn PopClient) -> Result<PopAnchorStatus, Error> {
+        let mut store = self.pop_load_store()?;
+        let info = self.pop_bind_ledger(client, &mut store)?;
+        self.pop_save_store(&store)?;
+        let chain = client.anchors().map_err(pop_err)?;
+        let Some(genesis_seal) = chain.genesis_seal else {
+            return Ok(PopAnchorStatus {
+                anchored_entries: 0,
+                genesis_seal: None,
+                anchor_txids: vec![],
+            });
+        };
+        if chain.records.is_empty() {
+            return Ok(PopAnchorStatus {
+                anchored_entries: 0,
+                genesis_seal: Some(genesis_seal.to_string()),
+                anchor_txids: vec![],
+            });
+        }
+        let last = chain.records.len() as u64 - 1;
+        if last >= info.next_index {
+            return Err(pop_err("ledger serves more anchors than sealed entries"));
+        }
+        let headers = client.headers(0, last).map_err(pop_err)?;
+        pop_core::verify_header_chain(
+            &Secp256k1::new(),
+            &info.ledger_id,
+            &info.operator_pubkey,
+            &headers,
+        )
+        .map_err(|e| pop_err(format!("anchored header chain invalid: {e}")))?;
+        verify_anchor_chain(&genesis_seal, &headers, &chain.records)
+            .map_err(|e| pop_err(format!("anchor chain fails validation: {e}")))?;
+        Ok(PopAnchorStatus {
+            anchored_entries: chain.records.len() as u64,
+            genesis_seal: Some(genesis_seal.to_string()),
+            anchor_txids: chain.records.iter().map(|r| r.txid().to_string()).collect(),
+        })
+    }
+
     /// Balance of a PoP asset.
     pub fn pop_get_asset_balance(&self, asset_id: &str) -> Result<PopBalance, Error> {
         let asset_id: H32 = asset_id
@@ -762,9 +844,9 @@ impl Wallet {
         let pending_change = store
             .pending_sends
             .iter()
-            .filter(|p| p.body.asset_id == asset_id)
-            .flat_map(|p| p.body.outputs.get(1))
-            .map(|o| o.amount)
+            .filter(|p| p.body.asset_id == asset_id && p.change_key_index.is_some())
+            .flat_map(|p| p.reveals.get(1))
+            .map(|r| r.output.amount)
             .sum();
         Ok(PopBalance {
             settled,

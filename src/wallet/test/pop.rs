@@ -121,6 +121,10 @@ fn pop_double_spend_is_prevented() {
         .or_else(|| store["coins"][0]["key_index"].as_u64())
         .unwrap() as u32;
     let keypair = sender.pop_test_derive_keypair(key_index);
+    let nonce = pop_core::tagged_hash(
+        "rgb-lib/pop/seal-nonce",
+        &keypair.secret_key().secret_bytes(),
+    );
     let msg = pop_core::tagged_hash("test/double-spend", b"second closure");
     let sig = secp.sign_schnorr(
         &pop_core::secp256k1::Message::from_digest(*msg.as_bytes()),
@@ -128,6 +132,7 @@ fn pop_double_spend_is_prevented() {
     );
     let result = ledger.publish(pop_core::Publication {
         pubkey: keypair.x_only_public_key().0,
+        nonce,
         msg_hash: msg,
         sig,
     });
@@ -190,18 +195,34 @@ fn pop_http_node_regtest_flow() {
             let _ = self.0.kill();
         }
     }
+    // anchor into the shared regtest bitcoind when it is reachable
+    let bitcoind_up = std::net::TcpStream::connect_timeout(
+        &"127.0.0.1:18443".parse().unwrap(),
+        Duration::from_millis(500),
+    )
+    .is_ok();
+    let mut args = vec![
+        s!("--bind"),
+        bind.to_string(),
+        s!("--data-dir"),
+        data_dir.to_str().unwrap().to_string(),
+        s!("--name"),
+        s!("rgb-lib-regtest-e2e"),
+        s!("--close-interval"),
+        s!("1"),
+    ];
+    if bitcoind_up {
+        args.extend([
+            s!("--btc-rpc"),
+            s!("http://127.0.0.1:18443"),
+            s!("--btc-wallet"),
+            s!("pop-anchor-e2e"),
+            s!("--btc-autofund"),
+        ]);
+    }
     let _node = NodeGuard(
         std::process::Command::new(&node_bin)
-            .args([
-                "--bind",
-                bind,
-                "--data-dir",
-                data_dir.to_str().unwrap(),
-                "--name",
-                "rgb-lib-regtest-e2e",
-                "--close-interval",
-                "1",
-            ])
+            .args(&args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -257,6 +278,20 @@ fn pop_http_node_regtest_flow() {
             .settled,
         100
     );
+    // with a reachable bitcoind, the ledger's seal chain is committed into
+    // Bitcoin — verify the anchor chain wallet-side
+    if bitcoind_up {
+        let anchors = sender.pop_verify_anchors(&client).unwrap();
+        assert!(
+            anchors.anchored_entries >= 1,
+            "expected anchored entries, got {anchors:?}"
+        );
+        assert!(anchors.genesis_seal.is_some());
+        println!(
+            "anchors verified: {} entries committed to Bitcoin, first txid {}",
+            anchors.anchored_entries, anchors.anchor_txids[0]
+        );
+    }
     println!(
         "HTTP regtest flow OK: issued 250, sent 100 over pop-node at {bind}, change 150"
     );
