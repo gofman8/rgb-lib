@@ -950,6 +950,11 @@ impl RgbRuntime {
             .map_err(InternalError::from)
     }
 
+    /// Update the RGB witnesses, protecting deliberately un-broadcast (`Tentative`) witnesses.
+    ///
+    /// The provided `resolver` is always wrapped in a [`TentativeStashResolver`], so no caller can
+    /// archive an off-chain branch just because the indexer has never seen it. See that type for
+    /// the full invariant.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub(crate) fn update_witnesses<R: ResolveWitness>(
         &mut self,
@@ -957,9 +962,114 @@ impl RgbRuntime {
         after_height: u32,
         force_witnesses: Vec<RgbTxid>,
     ) -> Result<UpdateRes, InternalError> {
-        self.stock
-            .update_witnesses(resolver, after_height, force_witnesses)
-            .map_err(InternalError::from)
+        self.update_witnesses_guarded(resolver, after_height, force_witnesses, vec![])
+    }
+
+    /// Same as [`RgbRuntime::update_witnesses`], additionally re-validating the witnesses in
+    /// `revalidate` as off-chain (`Tentative`) ones, served from the stash without consulting the
+    /// indexer. This is the repair path for a branch that has already been archived.
+    ///
+    /// A `revalidate` entry that cannot be repaired is always reported in [`UpdateRes::failed`],
+    /// including one that [`Stock::update_witnesses`] would never even visit (a witness id the
+    /// stock has no ord for, or one it skips because of `after_height`): silently reporting such a
+    /// no-op as a success would let a caller believe an off-chain branch was brought back when it
+    /// was not.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub(crate) fn update_witnesses_guarded<R: ResolveWitness>(
+        &mut self,
+        resolver: &R,
+        after_height: u32,
+        force_witnesses: Vec<RgbTxid>,
+        revalidate: Vec<RgbTxid>,
+    ) -> Result<UpdateRes, InternalError> {
+        let stored_ords: BTreeMap<RgbTxid, WitnessOrd> =
+            self.stock.as_state_provider().witnesses().release();
+
+        // every witness the guard may have to serve from the stash: the explicit repair list plus
+        // every witness currently stored as Tentative (i.e. deliberately un-broadcast)
+        let mut needed: BTreeSet<RgbTxid> = revalidate.iter().copied().collect();
+        needed.extend(
+            stored_ords
+                .iter()
+                .filter(|(_, ord)| matches!(ord, WitnessOrd::Tentative))
+                .map(|(id, _)| *id),
+        );
+        let mut stash_witnesses: BTreeMap<RgbTxid, PubWitness> = BTreeMap::new();
+        {
+            let stash = self.stock.as_stash_provider();
+            for witness_id in needed {
+                if let Ok(seal_witness) = stash.witness(witness_id) {
+                    stash_witnesses.insert(witness_id, seal_witness.public.clone());
+                }
+            }
+        }
+
+        // witnesses to be re-validated need to be visited by the stock even if they are Ignored
+        let mut stock_force = force_witnesses.clone();
+        stock_force.extend(revalidate.iter().copied());
+
+        // `Stock::update_witnesses` only ever iterates the witness ords it already holds, so a
+        // `revalidate` entry the stock has no ord for is never handed to the resolver at all: it
+        // can neither be repaired nor reported. Same for one the stock skips because of
+        // `after_height`. Fail closed by collecting those ids now and reporting them as failed.
+        let unvisited = unvisited_revalidate_ids(&stored_ords, &revalidate, after_height);
+
+        let guarded = TentativeStashResolver {
+            inner: resolver,
+            stored_ords,
+            stash_witnesses,
+            force_witnesses: force_witnesses.into_iter().collect(),
+            revalidate: revalidate.into_iter().collect(),
+        };
+
+        let mut update_res = self
+            .stock
+            .update_witnesses(&guarded, after_height, stock_force)
+            .map_err(InternalError::from)?;
+        for witness_id in unvisited {
+            update_res.failed.entry(witness_id).or_insert_with(|| {
+                s!("witness is not known to the stock: there is nothing to re-validate")
+            });
+        }
+        Ok(update_res)
+    }
+
+    /// The set of bundles the stock currently considers invalid.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub(crate) fn invalid_bundles(&self) -> BTreeSet<BundleId> {
+        self.stock.as_state_provider().invalid_bundles().release()
+    }
+
+    /// Overwrite the set of bundles the stock considers invalid, making it exactly `wanted`.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub(crate) fn set_invalid_bundles(
+        &mut self,
+        wanted: &BTreeSet<BundleId>,
+    ) -> Result<(), InternalError> {
+        let current = self.invalid_bundles();
+        let to_validate: Vec<BundleId> = current.difference(wanted).copied().collect();
+        let to_invalidate: Vec<BundleId> = wanted.difference(&current).copied().collect();
+        if to_validate.is_empty() && to_invalidate.is_empty() {
+            return Ok(());
+        }
+        let state = self.stock.as_state_provider_mut();
+        state
+            .begin_transaction()
+            .map_err(|e| InternalError::StockError(e.to_string()))?;
+        for bundle_id in to_validate {
+            state
+                .update_bundle(bundle_id, true)
+                .map_err(|e| InternalError::StockError(e.to_string()))?;
+        }
+        for bundle_id in to_invalidate {
+            state
+                .update_bundle(bundle_id, false)
+                .map_err(|e| InternalError::StockError(e.to_string()))?;
+        }
+        state
+            .commit_transaction()
+            .map_err(|e| InternalError::StockError(e.to_string()))?;
+        Ok(())
     }
 
     #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -1069,6 +1179,120 @@ impl<const TRANSFER: bool> ResolveWitness for OffchainResolver<'_, '_, TRANSFER>
     }
 }
 
+/// The `revalidate` ids that [`Stock::update_witnesses`] will never even look at, and which
+/// therefore cannot be repaired *nor* reported by it.
+///
+/// `Stock::update_witnesses` iterates exactly the witness ord map it already holds, skipping an
+/// entry mined below `after_height`. So an id absent from `stored_ords` — or one mined too low —
+/// never reaches the resolver: the repair is a silent no-op that would otherwise be
+/// indistinguishable from a success. Callers report these ids in [`UpdateRes::failed`] instead
+/// (fail closed).
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) fn unvisited_revalidate_ids(
+    stored_ords: &BTreeMap<RgbTxid, WitnessOrd>,
+    revalidate: &[RgbTxid],
+    after_height: u32,
+) -> Vec<RgbTxid> {
+    // mirrors `Stock::update_witnesses`, which clamps `after_height` to at least 1
+    let skip_below = NonZeroU32::new(after_height).unwrap_or(NonZeroU32::MIN);
+    revalidate
+        .iter()
+        .copied()
+        .filter(|witness_id| match stored_ords.get(witness_id) {
+            None => true,
+            Some(WitnessOrd::Mined(pos)) => pos.height() < skip_below,
+            Some(_) => false,
+        })
+        .collect()
+}
+
+/// Resolver wrapper enforcing the **carrier-stash invariant**: a witness that is deliberately
+/// un-broadcast (currently stored as [`WitnessOrd::Tentative`]) must never be archived just
+/// because the indexer has never seen it.
+///
+/// "The indexer does not know this TX" is evidence of invalidity only for a witness that was once
+/// broadcast. For an un-broadcast branch — a colored TES-R ladder, or the un-broadcast side of an
+/// off-chain split — it is the designed, expected state. Mapping it to [`WitnessOrd::Archived`]
+/// destroys the whole branch silently and irreversibly: the archival recurses into every
+/// descendant bundle (`set_bundles_as_invalid`), the resulting `invalid_bundles` set is part of
+/// the persisted stock, and the sqlite-derived balance does not move, so nothing observable
+/// changes.
+///
+/// Behavior, in order:
+/// * a witness id in `revalidate` is served from the stash as `Resolved(tx, Tentative)` without
+///   consulting the indexer (the repair path);
+/// * a witness the indexer resolves is passed through unchanged;
+/// * an `Unresolved` witness explicitly listed in `force_witnesses` is passed through unchanged —
+///   an explicit force is the *only* way to archive an un-broadcast witness;
+/// * an `Unresolved` witness currently stored as `Tentative` is served from the stash as
+///   `Resolved(tx, Tentative)`; when the stash holds no TX for it, a resolver error is returned so
+///   that the caller *skips* it (it lands in `UpdateRes::failed`) instead of archiving it;
+/// * everything else is passed through unchanged.
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub(crate) struct TentativeStashResolver<'a, R: ResolveWitness> {
+    /// The wrapped resolver (normally the blockchain one)
+    pub(crate) inner: &'a R,
+    /// Witness ord currently stored in the stock, per witness id
+    pub(crate) stored_ords: BTreeMap<RgbTxid, WitnessOrd>,
+    /// Public witnesses known to the stash, per witness id
+    pub(crate) stash_witnesses: BTreeMap<RgbTxid, PubWitness>,
+    /// Witness ids the caller explicitly forced (guard bypass: archival allowed)
+    pub(crate) force_witnesses: BTreeSet<RgbTxid>,
+    /// Witness ids to be resolved as off-chain (`Tentative`) from the stash (repair path)
+    pub(crate) revalidate: BTreeSet<RgbTxid>,
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl<R: ResolveWitness> TentativeStashResolver<'_, R> {
+    /// Serve a witness from the stash as an off-chain (`Tentative`) one. Fails closed when the
+    /// stash holds no TX for it: the caller then skips the witness instead of archiving it.
+    fn resolve_from_stash(
+        &self,
+        witness_id: RgbTxid,
+    ) -> Result<WitnessStatus, WitnessResolverError> {
+        match self
+            .stash_witnesses
+            .get(&witness_id)
+            .and_then(|pub_witness| pub_witness.tx().cloned())
+        {
+            Some(tx) => Ok(WitnessStatus::Resolved(tx, WitnessOrd::Tentative)),
+            None => Err(WitnessResolverError::ResolverIssue(
+                Some(witness_id),
+                s!(
+                    "witness is un-broadcast (Tentative) and the stash holds no TX for it: \
+                     refusing to archive it, skipping"
+                ),
+            )),
+        }
+    }
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl<R: ResolveWitness> ResolveWitness for TentativeStashResolver<'_, R> {
+    fn resolve_witness(&self, witness_id: RgbTxid) -> Result<WitnessStatus, WitnessResolverError> {
+        // repair path: explicitly re-validate this witness as off-chain, from the stash
+        if self.revalidate.contains(&witness_id) {
+            return self.resolve_from_stash(witness_id);
+        }
+        let status = self.inner.resolve_witness(witness_id)?;
+        if !matches!(status, WitnessStatus::Unresolved) {
+            return Ok(status);
+        }
+        // the indexer has never seen this TX; only an explicit force may archive it
+        if self.force_witnesses.contains(&witness_id) {
+            return Ok(status);
+        }
+        if self.stored_ords.get(&witness_id) != Some(&WitnessOrd::Tentative) {
+            return Ok(status);
+        }
+        self.resolve_from_stash(witness_id)
+    }
+
+    fn check_chain_net(&self, chain_net: ChainNet) -> Result<(), WitnessResolverError> {
+        self.inner.check_chain_net(chain_net)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1083,6 +1307,65 @@ mod tests {
     struct OptionalField {
         #[serde(deserialize_with = "from_str_or_number_optional")]
         val: Option<u64>,
+    }
+
+    /// A `revalidate` id the stock has no ord for is never visited by `Stock::update_witnesses`,
+    /// so the repair is a silent no-op. It must be reported, not counted as a success.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[test]
+    fn test_unvisited_revalidate_ids() {
+        use rgbstd::vm::WitnessPos;
+
+        let known_tentative = RgbTxid::from_str(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        let known_archived = RgbTxid::from_str(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap();
+        let known_mined = RgbTxid::from_str(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        )
+        .unwrap();
+        let unknown = RgbTxid::from_str(
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        )
+        .unwrap();
+
+        let mined_at_100 = WitnessPos::bitcoin(NonZeroU32::new(100).unwrap(), 1_600_000_000)
+            .expect("valid witness pos");
+        let stored_ords = BTreeMap::from([
+            (known_tentative, WitnessOrd::Tentative),
+            (known_archived, WitnessOrd::Archived),
+            (known_mined, WitnessOrd::Mined(mined_at_100)),
+        ]);
+
+        // an id the stock knows is visited (whatever its ord), an unknown one never is
+        assert_eq!(
+            unvisited_revalidate_ids(
+                &stored_ords,
+                &[known_tentative, known_archived, known_mined, unknown],
+                0,
+            ),
+            vec![unknown]
+        );
+        // ...and it stays reported even when it is the only entry
+        assert_eq!(
+            unvisited_revalidate_ids(&stored_ords, &[unknown], 0),
+            vec![unknown]
+        );
+        // an empty repair list never fabricates a failure
+        assert!(unvisited_revalidate_ids(&stored_ords, &[], 0).is_empty());
+        // `after_height` is clamped to 1, exactly like Stock::update_witnesses, so a witness mined
+        // at height 100 is still visited at after_height 0 and 100, but skipped above it
+        assert!(unvisited_revalidate_ids(&stored_ords, &[known_mined], 100).is_empty());
+        assert_eq!(
+            unvisited_revalidate_ids(&stored_ords, &[known_mined], 101),
+            vec![known_mined]
+        );
+        // a Tentative (un-broadcast) witness is never skipped by height
+        assert!(unvisited_revalidate_ids(&stored_ords, &[known_tentative], u32::MAX).is_empty());
     }
 
     #[test]

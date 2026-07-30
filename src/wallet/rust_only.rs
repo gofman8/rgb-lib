@@ -34,6 +34,30 @@ pub struct ColoringInfo {
 /// Map of contract ID and list of its beneficiaries
 pub type AssetBeneficiariesMap = BTreeMap<ContractId, Vec<BuilderSeal<GraphSeal>>>;
 
+/// A backup of the set of bundles the RGB stock considers invalid, as returned by
+/// [`Wallet::backup_invalid_bundles`] and consumed by [`Wallet::restore_invalid_bundles`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub struct InvalidBundlesBackup(pub(crate) BTreeSet<BundleId>);
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl InvalidBundlesBackup {
+    /// Number of invalid bundles in this backup
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether this backup holds no invalid bundle
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The IDs of the invalid bundles in this backup
+    pub fn bundle_ids(&self) -> Vec<String> {
+        self.0.iter().map(|id| id.to_string()).collect()
+    }
+}
+
 /// Indexer protocol
 #[derive(Debug, Clone)]
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -723,6 +747,13 @@ impl Wallet {
 
     /// Update RGB witnesses.
     ///
+    /// The blockchain resolver is wrapped so that a witness which is currently stored as
+    /// [`WitnessOrd::Tentative`] (i.e. a deliberately un-broadcast, off-chain one) is **never**
+    /// archived just because the indexer has never seen it: it is served from the stash as an
+    /// off-chain witness instead, or skipped (and reported in [`UpdateRes::failed`]) when the
+    /// stash holds no TX for it. Passing a witness id in `force_witnesses` is the only way to
+    /// archive such a witness. See `TentativeStashResolver` for the rationale.
+    ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
     #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -739,6 +770,73 @@ impl Wallet {
         )?;
         info!(self.logger(), "Update witnesses completed");
         Ok(update_res)
+    }
+
+    /// Re-validate off-chain (un-broadcast) bundles whose witnesses have been archived.
+    ///
+    /// Each TXID in `txids` is re-resolved from the stash as an off-chain
+    /// ([`WitnessOrd::Tentative`]) witness, without consulting the indexer and **without
+    /// broadcasting anything**. A witness that goes back from `Archived` to `Tentative` makes the
+    /// stock re-check the validity of its bundle and, recursively, of all its descendants, which
+    /// is the only way to clear entries from the persisted `invalid_bundles` set.
+    ///
+    /// Pass the whole chain, root-spend first, to repair a multi-level off-chain branch: a bundle
+    /// can only become valid again once all of its ancestors are valid.
+    ///
+    /// It fails, without changing anything about a given witness, if the stash holds no TX for it
+    /// or if the witness id is not known to the stock at all (the failure is reported in
+    /// [`UpdateRes::failed`], keyed by the witness id). A TXID that cannot be parsed is rejected
+    /// with [`Error::InvalidTxid`] and no witness is touched.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn revalidate_offchain_bundles(&self, txids: Vec<String>) -> Result<UpdateRes, Error> {
+        info!(self.logger(), "Revalidating offchain bundles...");
+        let witness_ids = txids
+            .iter()
+            .map(|t| RgbTxid::from_str(t).map_err(|_| Error::InvalidTxid))
+            .collect::<Result<Vec<_>, _>>()?;
+        let update_res = self.rgb_runtime()?.update_witnesses_guarded(
+            self.blockchain_resolver(),
+            0,
+            vec![],
+            witness_ids,
+        )?;
+        info!(self.logger(), "Revalidate offchain bundles completed");
+        Ok(update_res)
+    }
+
+    /// Return a backup of the set of bundles the RGB stock currently considers invalid.
+    ///
+    /// Take one before any operation that may invalidate bundles and give it to
+    /// [`Wallet::restore_invalid_bundles`] to undo the invalidation.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn backup_invalid_bundles(&self) -> Result<InvalidBundlesBackup, Error> {
+        info!(self.logger(), "Backing up invalid bundles...");
+        let backup = InvalidBundlesBackup(self.rgb_runtime()?.invalid_bundles());
+        info!(self.logger(), "Backup invalid bundles completed");
+        Ok(backup)
+    }
+
+    /// Restore the set of bundles the RGB stock considers invalid to a previously taken
+    /// [`InvalidBundlesBackup`], making it exactly the backed-up one.
+    ///
+    /// Note that a bundle whose witness is archived stays unusable even after its bundle id has
+    /// been removed from the invalid set: use [`Wallet::revalidate_offchain_bundles`] to also
+    /// bring the witnesses back to the off-chain (`Tentative`) state.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn restore_invalid_bundles(&self, backup: &InvalidBundlesBackup) -> Result<(), Error> {
+        info!(self.logger(), "Restoring invalid bundles...");
+        self.rgb_runtime()?.set_invalid_bundles(&backup.0)?;
+        info!(self.logger(), "Restore invalid bundles completed");
+        Ok(())
     }
 
     /// Manually set the [`WitnessOrd`] of a witness TX.

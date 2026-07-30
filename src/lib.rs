@@ -188,13 +188,17 @@ use rgbinvoice::{AddressPayload, Beneficiary, RgbInvoice, RgbInvoiceBuilder, XCh
 #[cfg(feature = "electrum")]
 use rgbstd::indexers::electrum_blocking::electrum_client::ConfigBuilder;
 use rgbstd::{
-    Allocation, Amount, Assign, Genesis, GraphSeal, Identity, KnownTransition, Layer1, Opout,
-    OutputSeal, OwnedFraction, Precision, Schema, SecretSeal, TokenIndex, Transition, TypeSystem,
+    Allocation, Amount, Assign, BundleId, Genesis, GraphSeal, Identity, KnownTransition, Layer1,
+    Opout, OutputSeal, OwnedFraction, Precision, Schema, SecretSeal, TokenIndex, Transition,
+    TypeSystem,
     containers::{BuilderSeal, Kit, ValidContract, ValidKit, ValidTransfer},
     contract::{AllocatedState, ContractBuilder, IssuerWrapper, SchemaWrapper, TransitionBuilder},
     info::SchemaInfo,
     invoice::{InvoiceState, Pay2Vout},
-    persistence::{MemContract, MemContractState, StashReadProvider, Stock, fs::FsBinStore},
+    persistence::{
+        MemContract, MemContractState, StashReadProvider, StateReadProvider, StateWriteProvider,
+        Stock, StoreTransaction, fs::FsBinStore,
+    },
     rgbcore::commit_verify::{
         CommitId, Conceal, TryCommitVerify,
         mpc::{Commitment, MerkleTree, Message, MultiSource, ProtocolId},

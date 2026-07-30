@@ -847,3 +847,420 @@ fn offline() {
     let result = wallet.list_unspents_vanilla(Online { id: 0 }, MIN_CONFIRMATIONS, false);
     assert_matches!(result, Err(Error::Offline));
 }
+
+// --- carrier-stash resolver invariant (E7) ---------------------------------------------------
+//
+// An un-broadcast ("Tentative") colored branch — a colored TES-R ladder rung, or the un-broadcast
+// side of an off-chain split — must survive `update_witnesses` with the plain blockchain
+// resolver.
+// Before the guard, one such call archived every rung of the branch: `succeeded=2`, no error, and
+// `get_asset_balance` unchanged, because the balance is computed from the sqlite tables while the
+// destruction happens in the RGB stock. Every assertion below therefore probes the STOCK with a
+// read-only `color_psbt` dry run, never the balance.
+
+/// Whether the bitcoind node knows nothing about `txid` (neither mined nor in the mempool). Used
+/// to prove that an off-chain rung is, and stays, un-broadcast.
+#[cfg(feature = "electrum")]
+fn tx_unknown_to_node(txid: &str) -> bool {
+    let mut args = bitcoin_cli();
+    args.extend([s!("getrawtransaction"), txid.to_string()]);
+    let output = Command::new("docker")
+        .stdin(Stdio::null())
+        .arg("compose")
+        .args(&args)
+        .output()
+        .expect("failed to query bitcoind");
+    !output.status.success()
+}
+
+/// Build an un-broadcast colored tier spending `prev` into a single P2TR output, consume its
+/// fascia. This is exactly the shape of an off-chain (never broadcast) ladder rung.
+#[cfg(feature = "electrum")]
+fn offchain_tier(
+    wallet: &Wallet,
+    prev: OutPoint,
+    dest: &str,
+    value: u64,
+    contract_id: ContractId,
+    amount: u64,
+    blinding: u64,
+) -> (bdk_wallet::bitcoin::Txid, u32) {
+    let mut psbt = unsigned_spend_psbt(prev, dest, value);
+    let coloring_info = tier_coloring_info(contract_id, amount, blinding);
+    wallet
+        .color_psbt_and_consume(&mut psbt, coloring_info)
+        .unwrap();
+    let txid = psbt.unsigned_tx.compute_txid();
+    // coloring puts the opret first (the payload output is P2TR), so the seal is not at vout 0
+    let vout = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .position(|o| !o.script_pubkey.is_op_return())
+        .unwrap() as u32;
+    (txid, vout)
+}
+
+#[cfg(feature = "electrum")]
+fn unsigned_spend_psbt(prev: OutPoint, dest: &str, value: u64) -> Psbt {
+    let address = BdkAddress::from_str(dest)
+        .unwrap()
+        .require_network(BdkNetwork::Regtest)
+        .unwrap();
+    let tx = BdkTransaction {
+        version: bdk_wallet::bitcoin::transaction::Version(3),
+        lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+        input: vec![bdk_wallet::bitcoin::TxIn {
+            previous_output: prev,
+            script_sig: Default::default(),
+            // a relative-CSV-shaped nSequence, like a TES-R tier
+            sequence: bdk_wallet::bitcoin::Sequence(10),
+            witness: bdk_wallet::bitcoin::Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: BdkAmount::from_sat(value),
+            script_pubkey: address.script_pubkey(),
+        }],
+    };
+    Psbt::from_unsigned_tx(tx).unwrap()
+}
+
+#[cfg(feature = "electrum")]
+fn tier_coloring_info(contract_id: ContractId, amount: u64, blinding: u64) -> ColoringInfo {
+    ColoringInfo {
+        asset_info_map: HashMap::from([(
+            contract_id,
+            AssetColoringInfo {
+                output_map: HashMap::from([(0u32, amount)]),
+                blinded_map: HashMap::new(),
+                static_blinding: Some(blinding),
+            },
+        )]),
+        static_blinding: Some(blinding),
+        nonce: None,
+    }
+}
+
+/// Read-only probe of the RGB stock: can it still see `amount` allocated at `prev`?
+///
+/// Uses `color_psbt` (NOT `color_psbt_and_consume`), so nothing is written to the stash. This is
+/// the assertion that matters: `get_asset_balance` keeps reporting the full settled balance even
+/// when the stash is dead.
+#[cfg(feature = "electrum")]
+fn stock_sees_allocation(
+    wallet: &Wallet,
+    prev: OutPoint,
+    dest: &str,
+    contract_id: ContractId,
+    amount: u64,
+    blinding: u64,
+) -> bool {
+    let mut psbt = unsigned_spend_psbt(prev, dest, 1000);
+    let coloring_info = tier_coloring_info(contract_id, amount, blinding);
+    match wallet.color_psbt(&mut psbt, coloring_info) {
+        Ok(_) => true,
+        Err(Error::InvalidColoringInfo { details }) => {
+            println!("stock probe on {prev} failed: {details}");
+            false
+        }
+        Err(e) => panic!("unexpected stock probe error: {e:?}"),
+    }
+}
+
+/// Build a 2-rung, never-broadcast colored ladder over an issued asset.
+/// Returns (contract id, destination address, root outpoint, rung 1 outpoint, rung 2 outpoint).
+#[cfg(feature = "electrum")]
+fn build_offchain_ladder(
+    party: &mut SinglesigParty,
+    blinding: u64,
+    amount: u64,
+) -> (ContractId, String, OutPoint, OutPoint, OutPoint) {
+    let asset = party.issue_asset_nia(Some(&[amount]));
+    let contract_id = ContractId::from_str(&asset.asset_id).unwrap();
+
+    let root = party
+        .list_unspents(false)
+        .iter()
+        .find_map(|u| {
+            u.rgb_allocations
+                .iter()
+                .any(|a| a.asset_id.as_deref() == Some(&asset.asset_id))
+                .then(|| OutPoint {
+                    txid: bdk_wallet::bitcoin::Txid::from_str(&u.utxo.outpoint.txid).unwrap(),
+                    vout: u.utxo.outpoint.vout,
+                })
+        })
+        .expect("no allocation for the issued asset");
+
+    let dest = party.get_address();
+    let (txid_1, vout_1) = offchain_tier(
+        &party.wallet,
+        root,
+        &dest,
+        900,
+        contract_id,
+        amount,
+        blinding,
+    );
+    let rung_1 = OutPoint {
+        txid: txid_1,
+        vout: vout_1,
+    };
+    let (txid_2, vout_2) = offchain_tier(
+        &party.wallet,
+        rung_1,
+        &dest,
+        800,
+        contract_id,
+        amount,
+        blinding,
+    );
+    let rung_2 = OutPoint {
+        txid: txid_2,
+        vout: vout_2,
+    };
+
+    // neither rung is on chain nor in the mempool, by design
+    for txid in [txid_1, txid_2] {
+        assert!(
+            tx_unknown_to_node(&txid.to_string()),
+            "rung {txid} unexpectedly known to the node"
+        );
+    }
+
+    // the stock knows both rungs before anything else happens
+    assert!(stock_sees_allocation(
+        &party.wallet,
+        rung_1,
+        &dest,
+        contract_id,
+        amount,
+        blinding
+    ));
+    assert!(stock_sees_allocation(
+        &party.wallet,
+        rung_2,
+        &dest,
+        contract_id,
+        amount,
+        blinding
+    ));
+
+    (contract_id, dest, root, rung_1, rung_2)
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn update_witnesses_keeps_offchain_ladder_alive() {
+    initialize();
+
+    let blinding = 61;
+    let amount = AMOUNT;
+    let mut party = get_funded_party!();
+    let (contract_id, dest, root, rung_1, rung_2) =
+        build_offchain_ladder(&mut party, blinding, amount);
+
+    // the call that used to kill the ladder: plain blockchain resolver, no forced witness
+    let update_res = party.wallet.update_witnesses(0, vec![]).unwrap();
+    println!("update_witnesses: {update_res:?}");
+
+    // one call -> both rungs ALIVE (before the guard: both dead, with succeeded=2 and no error)
+    assert!(
+        stock_sees_allocation(&party.wallet, rung_1, &dest, contract_id, amount, blinding),
+        "rung 1 was archived by update_witnesses"
+    );
+    assert!(
+        stock_sees_allocation(&party.wallet, rung_2, &dest, contract_id, amount, blinding),
+        "rung 2 (the ladder tip) was archived by update_witnesses"
+    );
+    // the on-chain root keeps working as well
+    assert!(stock_sees_allocation(
+        &party.wallet,
+        root,
+        &dest,
+        contract_id,
+        amount,
+        blinding
+    ));
+
+    // it stays alive across repeated calls and a mined block
+    mine(false);
+    party.wallet.update_witnesses(0, vec![]).unwrap();
+    party.refresh_all();
+    party.wallet.update_witnesses(0, vec![]).unwrap();
+    assert!(stock_sees_allocation(
+        &party.wallet,
+        rung_2,
+        &dest,
+        contract_id,
+        amount,
+        blinding
+    ));
+
+    // the guard is not a blanket "never archive": an explicit force still archives, so a caller
+    // that really wants to drop an un-broadcast branch can still do it
+    let forced = vec![RgbTxid::from_str(&rung_1.txid.to_string()).unwrap()];
+    party.wallet.update_witnesses(0, forced).unwrap();
+    assert!(
+        !stock_sees_allocation(&party.wallet, rung_1, &dest, contract_id, amount, blinding),
+        "an explicitly forced witness must still be archivable"
+    );
+    assert!(
+        !stock_sees_allocation(&party.wallet, rung_2, &dest, contract_id, amount, blinding),
+        "archiving a rung must invalidate its descendants"
+    );
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn revalidate_offchain_bundles_repairs_archived_ladder() {
+    initialize();
+
+    let blinding = 62;
+    let amount = AMOUNT;
+    let mut party = get_funded_party!();
+    let (contract_id, dest, _root, rung_1, rung_2) =
+        build_offchain_ladder(&mut party, blinding, amount);
+
+    let backup = party.wallet.backup_invalid_bundles().unwrap();
+    assert!(backup.is_empty());
+
+    // deliberately destroy the ladder, the only way that is still possible: an explicit force
+    let forced = vec![
+        RgbTxid::from_str(&rung_1.txid.to_string()).unwrap(),
+        RgbTxid::from_str(&rung_2.txid.to_string()).unwrap(),
+    ];
+    party.wallet.update_witnesses(0, forced).unwrap();
+    assert!(!stock_sees_allocation(
+        &party.wallet,
+        rung_1,
+        &dest,
+        contract_id,
+        amount,
+        blinding
+    ));
+    assert!(!stock_sees_allocation(
+        &party.wallet,
+        rung_2,
+        &dest,
+        contract_id,
+        amount,
+        blinding
+    ));
+    // the bundles are now recorded as invalid in the (persisted) stock
+    let broken = party.wallet.backup_invalid_bundles().unwrap();
+    assert!(!broken.is_empty());
+
+    // repair, WITHOUT broadcasting anything: root-spend first
+    let update_res = party
+        .wallet
+        .revalidate_offchain_bundles(vec![rung_1.txid.to_string(), rung_2.txid.to_string()])
+        .unwrap();
+    println!("revalidate_offchain_bundles: {update_res:?}");
+    assert!(update_res.failed.is_empty());
+
+    // both rungs are back
+    assert!(
+        stock_sees_allocation(&party.wallet, rung_1, &dest, contract_id, amount, blinding),
+        "rung 1 was not repaired"
+    );
+    assert!(
+        stock_sees_allocation(&party.wallet, rung_2, &dest, contract_id, amount, blinding),
+        "rung 2 was not repaired"
+    );
+    // and nothing was broadcast to get there
+    for txid in [rung_1.txid, rung_2.txid] {
+        assert!(
+            tx_unknown_to_node(&txid.to_string()),
+            "repair broadcast {txid}"
+        );
+    }
+    // the invalid-bundle set is back to the backed-up one
+    assert_eq!(party.wallet.backup_invalid_bundles().unwrap(), backup);
+
+    // an unknown TXID cannot be revalidated: it is reported as failed, nothing is resurrected.
+    // NB: the stock only ever iterates the witness ords it already holds, so without the explicit
+    // unvisited-witness accounting in `update_witnesses_guarded` this call would silently report
+    // success (`failed` empty, `succeeded` counting the *other*, unrelated witnesses) and a caller
+    // would believe a branch had been repaired when nothing at all happened.
+    let fake_txid = RgbTxid::from_str(FAKE_TXID).unwrap();
+    let invalid_before = party.wallet.backup_invalid_bundles().unwrap();
+    let update_res = party
+        .wallet
+        .revalidate_offchain_bundles(vec![FAKE_TXID.to_string()])
+        .unwrap();
+    println!("revalidate_offchain_bundles(unknown): {update_res:?}");
+    assert!(
+        update_res.failed.contains_key(&fake_txid),
+        "an unknown TXID must be reported in UpdateRes::failed, got {update_res:?}"
+    );
+    // nothing was resurrected and nothing was invalidated by the failed repair
+    assert_eq!(party.wallet.backup_invalid_bundles().unwrap(), invalid_before);
+    assert!(
+        stock_sees_allocation(&party.wallet, rung_2, &dest, contract_id, amount, blinding),
+        "a failed repair must not disturb the repaired ladder"
+    );
+
+    // a TXID that cannot even be parsed is rejected outright
+    let result = party.wallet.revalidate_offchain_bundles(vec![s!("invalid")]);
+    assert_matches!(result, Err(Error::InvalidTxid));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn restore_invalid_bundles_success() {
+    initialize();
+
+    let blinding = 63;
+    let amount = AMOUNT;
+    let mut party = get_funded_party!();
+    let (contract_id, dest, _root, rung_1, rung_2) =
+        build_offchain_ladder(&mut party, blinding, amount);
+
+    // a backup taken while everything is healthy holds no invalid bundle
+    let healthy = party.wallet.backup_invalid_bundles().unwrap();
+    assert!(healthy.is_empty());
+    assert!(healthy.bundle_ids().is_empty());
+
+    // break the ladder and back up the broken set
+    let forced = vec![RgbTxid::from_str(&rung_1.txid.to_string()).unwrap()];
+    party.wallet.update_witnesses(0, forced).unwrap();
+    let broken = party.wallet.backup_invalid_bundles().unwrap();
+    assert!(!broken.is_empty());
+    assert_eq!(broken.bundle_ids().len(), broken.len());
+
+    // restoring the healthy backup clears the invalid-bundle set
+    party.wallet.restore_invalid_bundles(&healthy).unwrap();
+    assert!(party.wallet.backup_invalid_bundles().unwrap().is_empty());
+
+    // restoring the broken backup puts it back, exactly
+    party.wallet.restore_invalid_bundles(&broken).unwrap();
+    assert_eq!(party.wallet.backup_invalid_bundles().unwrap(), broken);
+
+    // clearing the invalid set alone is NOT a repair: the witness ord is still Archived, so the
+    // rungs stay invisible until the witnesses are revalidated as offchain ones
+    party.wallet.restore_invalid_bundles(&healthy).unwrap();
+    assert!(!stock_sees_allocation(
+        &party.wallet,
+        rung_2,
+        &dest,
+        contract_id,
+        amount,
+        blinding
+    ));
+    party
+        .wallet
+        .revalidate_offchain_bundles(vec![rung_1.txid.to_string(), rung_2.txid.to_string()])
+        .unwrap();
+    assert!(stock_sees_allocation(
+        &party.wallet,
+        rung_2,
+        &dest,
+        contract_id,
+        amount,
+        blinding
+    ));
+}
