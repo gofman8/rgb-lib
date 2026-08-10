@@ -34,6 +34,77 @@ pub struct ColoringInfo {
 /// Map of contract ID and list of its beneficiaries
 pub type AssetBeneficiariesMap = BTreeMap<ContractId, Vec<BuilderSeal<GraphSeal>>>;
 
+/// Why the RGB stock will, or will not, let an allocation be spent out of an outpoint.
+///
+/// Returned by [`Wallet::diagnose_allocation`]. See [`AllocationDiagnosis`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub enum AllocationVerdict {
+    /// The stock will spend a non-zero amount out of this outpoint. `color_psbt` will succeed for
+    /// any amount up to [`AllocationDiagnosis::visible_amount`].
+    Spendable,
+    /// The stock holds no ord for this outpoint's witness — the branch was never accepted into
+    /// THIS wallet (or was accepted into a different data dir). `check_witness` fails on `None`,
+    /// so the allocation is invisible even though the stash may hold the consignment.
+    WitnessUnknownToStock,
+    /// **The E7 class.** The witness is stored as [`WitnessOrd::Archived`]: something resolved a
+    /// deliberately un-broadcast transaction with the plain blockchain resolver, and
+    /// `WitnessStatus::Unresolved` maps to `Archived`. The allocation is filtered out by
+    /// `check_witness` and stays that way across restarts — `Archived` is persisted.
+    ///
+    /// Repairable, without broadcasting anything, via [`Wallet::revalidate_offchain_bundles`].
+    WitnessArchived,
+    /// The witness is fine but the allocation is still invisible, and the stock holds at least one
+    /// invalid bundle — the recursive half of the E7 class (`set_bundles_as_invalid` walks
+    /// descendants). Repairable via [`Wallet::restore_invalid_bundles`] /
+    /// [`Wallet::revalidate_offchain_bundles`].
+    BundleInvalidated,
+    /// The witness is live and no bundle is invalid, yet nothing is assigned to this outpoint: the
+    /// seal was never revealed here. This is NOT the E7 class — it is a receive that never landed
+    /// (wrong vout, wrong blinding, or a consignment that assigns elsewhere).
+    SealNotRevealed,
+}
+
+/// Read-only diagnosis of one outpoint's allocation in the RGB stock, as returned by
+/// [`Wallet::diagnose_allocation`].
+///
+/// Every field is an INPUT to the two filters `contract_assignments_for` applies, so the verdict
+/// is derived rather than guessed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+pub struct AllocationDiagnosis {
+    /// The outpoint asked about, `txid:vout`.
+    pub outpoint: String,
+    /// Fungible amount `contract_assignments_for` currently returns for it — i.e. exactly what
+    /// `color_psbt` will compare an `output_map` against.
+    pub visible_amount: u64,
+    /// The ord the stock stores for this outpoint's own witness transaction, if any. `Tentative`
+    /// is the CORRECT value for a deliberately un-broadcast branch; `Archived` is the E7 defect.
+    pub witness_ord: Option<String>,
+    /// Whether the stash holds the witness transaction itself. Together with `witness_ord` this
+    /// separates "never accepted here" from "accepted, then invalidated".
+    pub stash_holds_witness_tx: bool,
+    /// Size of the stock's persisted `invalid_bundles` set. Non-zero on a healthy wallet is
+    /// already a smell: bundles are only invalidated by archival.
+    pub invalid_bundle_count: usize,
+}
+
+#[cfg(any(feature = "electrum", feature = "esplora"))]
+impl AllocationDiagnosis {
+    /// The classification, derived from the fields.
+    pub fn verdict(&self) -> AllocationVerdict {
+        if self.visible_amount > 0 {
+            return AllocationVerdict::Spendable;
+        }
+        match self.witness_ord.as_deref() {
+            None => AllocationVerdict::WitnessUnknownToStock,
+            Some(ord) if ord.eq_ignore_ascii_case("archived") => AllocationVerdict::WitnessArchived,
+            _ if self.invalid_bundle_count > 0 => AllocationVerdict::BundleInvalidated,
+            _ => AllocationVerdict::SealNotRevealed,
+        }
+    }
+}
+
 /// A backup of the set of bundles the RGB stock considers invalid, as returned by
 /// [`Wallet::backup_invalid_bundles`] and consumed by [`Wallet::restore_invalid_bundles`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -662,6 +733,97 @@ impl Wallet {
         ))
     }
 
+    /// **CTES-R.** Accept a consignment whose witness chain is (partly) UN-BROADCAST, revealing the
+    /// seals of SEVERAL outputs at once — one per tier of a colored TES-R ladder.
+    ///
+    /// [`Self::accept_transfer`] cannot do this, for two independent reasons:
+    ///
+    /// * it builds its resolver with a SINGLE off-chain witness id (`vec![witness_id]`), so the
+    ///   leaf's own un-broadcast ancestors (`T`, `X_m`) fall through to the indexer, which has
+    ///   never seen them — `Unresolved` maps to `Archived` and the whole consignment is rejected;
+    /// * it reveals exactly ONE seal. A ladder receiver must also be able to open the EXTENSION's
+    ///   payload output, because that is the outpoint the next hop's state tier spends. Without
+    ///   that seal `color_psbt` finds no assignment there and the coin becomes exit-only.
+    ///
+    /// `offchain_txids` is the ordered ladder (root-spend → leaf); `seals` is
+    /// `(txid, vout, blinding)` for every tier output the receiver must be able to open. Returns
+    /// the assignments the LAST seal receives (the leaf — the receiver's own exit output).
+    ///
+    /// Nothing here consults the plain blockchain resolver for a ladder witness: every id in
+    /// `offchain_txids` is served from the consignment's own bundled witnesses
+    /// (`docs/utexo/CTESR-GATE.md` §3.3).
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn accept_offchain_ladder(
+        &mut self,
+        consignment: RgbTransfer,
+        offchain_txids: &[String],
+        seals: &[(String, u32, u64)],
+    ) -> Result<Vec<Assignment>, Error> {
+        info!(self.logger(), "Accepting offchain ladder...");
+        if seals.is_empty() {
+            return Err(Error::Internal {
+                details: s!("an offchain ladder must reveal at least one seal"),
+            });
+        }
+        let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
+        self.check_schema_support(&asset_schema)?;
+
+        let offchain_witness_ids = offchain_txids
+            .iter()
+            .map(|t| RgbTxid::from_str(t).map_err(|_| Error::InvalidTxid))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut runtime = self.rgb_runtime()?;
+        // Reveal EVERY tier seal before validating: `store_secret_seal` is what turns the
+        // consignment's concealed assignments into allocations this wallet can later spend.
+        for (_, vout, blinding) in seals {
+            runtime.store_secret_seal(GraphSeal::with_blinded_vout(*vout, *blinding))?;
+        }
+
+        let resolver = OffchainResolver {
+            offchain_witness_ids,
+            consignment: &consignment,
+            fallback: self.blockchain_resolver(),
+        };
+
+        let trusted_typesystem = asset_schema.types();
+        let validation_config = ValidationConfig {
+            chain_net: self.chain_net(),
+            trusted_typesystem,
+            ..Default::default()
+        };
+        let valid_consignment = match consignment.clone().validate(&resolver, &validation_config) {
+            Ok(consignment) => consignment,
+            Err(ValidationError::InvalidConsignment(e)) => {
+                error!(self.logger(), "Ladder consignment is invalid: {}", e);
+                return Err(Error::InvalidConsignment);
+            }
+            Err(ValidationError::ResolverError(e)) => {
+                warn!(self.logger(), "Network error validating ladder consignment");
+                return Err(Error::Network {
+                    details: e.to_string(),
+                });
+            }
+        };
+
+        let valid_contract = valid_consignment.clone().into_valid_contract();
+        runtime
+            .import_contract(valid_contract, &resolver)
+            .map_err(|e| Error::Internal {
+                details: format!("failure importing validated ladder contract: {e}"),
+            })?;
+
+        let (leaf_txid, leaf_vout, _) = seals.last().expect("checked non-empty");
+        let leaf_witness = RgbTxid::from_str(leaf_txid).map_err(|_| Error::InvalidTxid)?;
+        let received =
+            self.extract_received_assignments(&consignment, leaf_witness, Some(*leaf_vout), None);
+
+        runtime.accept_transfer(valid_consignment, &resolver)?;
+
+        info!(self.logger(), "Accept offchain ladder completed");
+        Ok(received.into_values().collect())
+    }
+
     /// Off-chain validate `consignment` against the un-broadcast branch `offchain_txids` and
     /// return the fungible amount the consignment assigns to the receiver's OWN witness outpoint
     /// (`witness_txid`:`vout`). This is the consignment-derived amount: a receiver books it
@@ -805,6 +967,81 @@ impl Wallet {
         )?;
         info!(self.logger(), "Revalidate offchain bundles completed");
         Ok(update_res)
+    }
+
+    /// **Read-only forensic answer to "why did `color_psbt` refuse this outpoint?"**
+    ///
+    /// `color_psbt` reads the allocation through `Stock::contract_assignments_for`, which reads
+    /// `ContractStateRead::fungible_all()`, which drops every allocation failing either of two
+    /// filters:
+    ///
+    /// * `check_witness` — the allocation's witness must be present in the stock's witness-ord map
+    ///   and must NOT be [`WitnessOrd::Archived`];
+    /// * `check_bundle` — the allocation's bundle must not be in the persisted `invalid_bundles`
+    ///   set.
+    ///
+    /// When either drops it, `color_psbt` computes `asset_available_amt = 0` and answers
+    /// `InvalidColoringInfo { "total amount in output_map (N) greater than available (0)" }` — a
+    /// message that names neither filter. Meanwhile the sqlite-derived balance
+    /// (`get_asset_balance`) is computed from the DB and does not move, so nothing observable
+    /// changes. That combination is what makes this class so expensive to diagnose from outside.
+    ///
+    /// This returns the inputs to both filters, plus the visible amount, for the witness of
+    /// `outpoint` (the transaction that CREATED it — which is the witness of any seal closed over
+    /// it). Nothing is consumed, no witness is resolved and no indexer is consulted: it is safe
+    /// against a live coin, including a deliberately un-broadcast one.
+    ///
+    /// See [`AllocationDiagnosis::verdict`] for the classification.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn diagnose_allocation(
+        &self,
+        contract_id: String,
+        outpoint: Outpoint,
+    ) -> Result<AllocationDiagnosis, Error> {
+        let contract = ContractId::from_str(&contract_id).map_err(|_| Error::Internal {
+            details: format!("invalid contract id: {contract_id}"),
+        })?;
+        let witness_id = RgbTxid::from_str(&outpoint.txid).map_err(|_| Error::InvalidTxid)?;
+        let runtime = self.rgb_runtime()?;
+
+        let rgb_outpoint = OutPoint::new(witness_id, outpoint.vout);
+        let visible_amount: u64 = runtime
+            .contract_assignments_for(contract, [rgb_outpoint])?
+            .into_values()
+            .flat_map(|m| m.into_values())
+            .map(|state| match state {
+                AllocatedState::Amount(amt) => amt.as_u64(),
+                _ => 0,
+            })
+            .sum();
+
+        let witness_ord = runtime.witness_ords().get(&witness_id).map(|o| o.to_string());
+        let stash_holds_witness_tx = runtime.stash_holds_witness_tx(witness_id);
+        let invalid_bundle_count = runtime.invalid_bundles().len();
+
+        Ok(AllocationDiagnosis {
+            outpoint: outpoint.to_string(),
+            visible_amount,
+            witness_ord,
+            stash_holds_witness_tx,
+            invalid_bundle_count,
+        })
+    }
+
+    /// Every witness the RGB stock holds an ord for, as `(txid, ord)`, sorted by txid. Read-only.
+    ///
+    /// The companion to [`Wallet::diagnose_allocation`] when the question is about a CHAIN of
+    /// un-broadcast witnesses rather than one outpoint: it shows, in one shot, which rungs of a
+    /// ladder are `Tentative` (correct for an un-broadcast branch) and which have been flipped to
+    /// `Archived`.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn witness_ords(&self) -> Result<Vec<(String, String)>, Error> {
+        Ok(self
+            .rgb_runtime()?
+            .witness_ords()
+            .into_iter()
+            .map(|(id, ord)| (id.to_string(), ord.to_string()))
+            .collect())
     }
 
     /// Return a backup of the set of bundles the RGB stock currently considers invalid.

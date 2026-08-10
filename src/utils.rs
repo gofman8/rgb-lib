@@ -1040,6 +1040,32 @@ impl RgbRuntime {
         self.stock.as_state_provider().invalid_bundles().release()
     }
 
+    /// Every witness the STOCK holds an ord for, with that ord.
+    ///
+    /// This is the map `MemContract`'s allocation filter is built from
+    /// (`OutputAssignment::check_witness`): an allocation whose witness is absent from it, or
+    /// present as [`WitnessOrd::Archived`], is invisible to `contract_assignments_for` — and
+    /// therefore to `color_psbt`, which is what turns into `Invalid coloring info`.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub(crate) fn witness_ords(&self) -> BTreeMap<RgbTxid, WitnessOrd> {
+        self.stock.as_state_provider().witnesses().release()
+    }
+
+    /// True when the STASH holds the witness transaction for `witness_id`.
+    ///
+    /// Distinct from [`RgbRuntime::witness_ords`]: the stash is the material (the TX itself), the
+    /// state is the verdict (its ord). A witness can be present in one and not the other, and
+    /// which one is missing is the difference between "this wallet never accepted the branch" and
+    /// "this wallet accepted it and then threw the verdict away".
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub(crate) fn stash_holds_witness_tx(&self, witness_id: RgbTxid) -> bool {
+        self.stock
+            .as_stash_provider()
+            .witness(witness_id)
+            .map(|w| w.public.tx().is_some())
+            .unwrap_or(false)
+    }
+
     /// Overwrite the set of bundles the stock considers invalid, making it exactly `wanted`.
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub(crate) fn set_invalid_bundles(

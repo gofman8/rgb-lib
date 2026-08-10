@@ -202,7 +202,15 @@ pub enum Error {
     },
 
     /// The provided coloring info is invalid
-    #[error("Invalid coloring info")]
+    ///
+    /// `details` is interpolated deliberately. This variant carries the only description of WHICH
+    /// of `color_psbt`'s five refusals fired — in particular
+    /// `"total amount in output_map (N) greater than available (0)"`, the one an off-chain carrier
+    /// hits when its allocation is invisible to the stock. Dropping it left every caller with the
+    /// bare string "Invalid coloring info", which names no cause and cannot be acted on; the
+    /// available-zero case then looks identical to a bad vout or a malformed blinded recipient id.
+    /// [D3] measured that cost: the refusal was unexplained for as long as the message was silent.
+    #[error("Invalid coloring info: {details}")]
     InvalidColoringInfo {
         /// Error details
         details: String,
