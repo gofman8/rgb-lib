@@ -56,6 +56,7 @@ fn success() {
         output_map,
             blinded_map: std::collections::HashMap::new(),
         static_blinding: Some(blinding),
+        output_blinding: HashMap::new(),
     };
     let asset_info_map: HashMap<ContractId, AssetColoringInfo> = HashMap::from_iter([(
         ContractId::from_str(&asset.asset_id).unwrap(),
@@ -355,6 +356,7 @@ fn color_psbt_uda() {
         output_map,
             blinded_map: std::collections::HashMap::new(),
         static_blinding: None,
+        output_blinding: HashMap::new(),
     };
     let asset_info_map: HashMap<ContractId, AssetColoringInfo> = HashMap::from_iter([(
         ContractId::from_str(&asset.asset_id).unwrap(),
@@ -464,6 +466,7 @@ fn color_psbt_fail() {
         output_map: output_map.clone(),
             blinded_map: std::collections::HashMap::new(),
         static_blinding: Some(blinding),
+        output_blinding: HashMap::new(),
     };
     let asset_info_map: HashMap<ContractId, AssetColoringInfo> =
         HashMap::from_iter([(ContractId::from_str(fake_cid).unwrap(), asset_coloring_info)]);
@@ -483,6 +486,7 @@ fn color_psbt_fail() {
         output_map: fake_o_map,
             blinded_map: std::collections::HashMap::new(),
         static_blinding: Some(blinding),
+        output_blinding: HashMap::new(),
     };
     let asset_info_map: HashMap<ContractId, AssetColoringInfo> = HashMap::from_iter([(
         ContractId::from_str(&asset.asset_id).unwrap(),
@@ -503,6 +507,7 @@ fn color_psbt_fail() {
         output_map: fake_o_map,
             blinded_map: std::collections::HashMap::new(),
         static_blinding: Some(blinding),
+        output_blinding: HashMap::new(),
     };
     let asset_info_map: HashMap<ContractId, AssetColoringInfo> = HashMap::from_iter([(
         ContractId::from_str(&asset.asset_id).unwrap(),
@@ -934,6 +939,7 @@ fn tier_coloring_info(contract_id: ContractId, amount: u64, blinding: u64) -> Co
                 output_map: HashMap::from([(0u32, amount)]),
                 blinded_map: HashMap::new(),
                 static_blinding: Some(blinding),
+                output_blinding: HashMap::new(),
             },
         )]),
         static_blinding: Some(blinding),

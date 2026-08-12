@@ -16,8 +16,24 @@ pub struct AssetColoringInfo {
     /// a receiver's existing UTXO (e.g. a statechain UTXO) or route change to a free existing UTXO,
     /// so a transfer can consume a statechain UTXO and send change back to another statechain UTXO.
     pub blinded_map: HashMap<String, u64>,
-    /// Static blinding to keep the transaction construction deterministic
+    /// Static blinding to keep the transaction construction deterministic.
+    ///
+    /// ⚠️ **ONE value for EVERY vout.** That is fine for a single-payload transaction and is a
+    /// PRIVACY LEAK the moment there is more than one: every payload seal is then blinded with the
+    /// same secret, so a recipient who learns it for their own output can de-conceal every sibling
+    /// seal in the same transaction — i.e. see who else was paid, and how much, out of a batch they
+    /// were only entitled to one leg of. Use [`Self::output_blinding`] to give each vout its own.
     pub static_blinding: Option<u64>,
+    /// **Per-vout blinding, which takes precedence over [`Self::static_blinding`].**
+    ///
+    /// A seal's blinding is what conceals it; sharing one across a transaction's payload outputs
+    /// makes the concealment collective rather than per-recipient. A multi-payee split needs each
+    /// leg blinded independently, and needs it to be DETERMINISTIC (so the transaction can be
+    /// rebuilt byte-for-byte on a retry) — which `new_random_vout` is not.
+    ///
+    /// Absent for a vout: fall back to `static_blinding`, then to a random blinding. So an existing
+    /// single-payload caller is unaffected by construction.
+    pub output_blinding: HashMap<u32, u64>,
 }
 
 /// RGB information to color a transaction
@@ -477,7 +493,13 @@ impl Wallet {
                         details: s!("invalid vout in output_map, does not exist in the given PSBT"),
                     });
                 }
-                let graph_seal = if let Some(blinding) = asset_coloring_info.static_blinding {
+                // Per-vout FIRST: a shared blinding across payload outputs lets any one recipient
+                // de-conceal every sibling seal, so the specific value must win over the shared one.
+                let graph_seal = if let Some(blinding) =
+                    asset_coloring_info.output_blinding.get(&vout).copied()
+                {
+                    GraphSeal::with_blinded_vout(vout, blinding)
+                } else if let Some(blinding) = asset_coloring_info.static_blinding {
                     GraphSeal::with_blinded_vout(vout, blinding)
                 } else {
                     GraphSeal::new_random_vout(vout)
@@ -1301,6 +1323,8 @@ impl Wallet {
                     output_map: HashMap::from([(0u32, rgb_amount)]),
                     blinded_map: HashMap::new(),
                     static_blinding: Some(blinding),
+                    // One payload output, so there is nothing to separate.
+                    output_blinding: HashMap::new(),
                 },
             )]),
             static_blinding: Some(blinding),
@@ -1482,5 +1506,66 @@ mod tests {
     fn display_indexer_protocol() {
         assert_eq!(IndexerProtocol::Electrum.to_string(), "Electrum");
         assert_eq!(IndexerProtocol::Esplora.to_string(), "Esplora");
+    }
+}
+
+/// **[P2] Per-output blinding — the seal-privacy property, in isolation.**
+///
+/// A seal's blinding is what conceals it. `static_blinding` applies ONE value to every payload
+/// output, so in a multi-payee transaction every seal shares a secret: a recipient who learns it for
+/// their own leg can de-conceal every sibling seal and read who else was paid and how much, out of a
+/// batch they were entitled to one leg of. `output_blinding` gives each vout its own.
+///
+/// These pin the selection rule directly, because it is the whole mechanism: per-vout wins, then the
+/// shared value, then random — and per-vout entries must actually differ, or the field is present
+/// and the leak is not closed.
+#[cfg(test)]
+mod p2_per_output_blinding_tests {
+    use super::*;
+
+    fn info(static_b: Option<u64>, per: &[(u32, u64)]) -> AssetColoringInfo {
+        AssetColoringInfo {
+            output_map: HashMap::from([(0u32, 100u64), (1u32, 200u64)]),
+            blinded_map: HashMap::new(),
+            static_blinding: static_b,
+            output_blinding: per.iter().copied().collect(),
+        }
+    }
+
+    /// The selection the colouring loop makes, extracted so the precedence is testable without a
+    /// PSBT: per-vout, then shared, then random (`None` here standing for "random").
+    fn chosen(i: &AssetColoringInfo, vout: u32) -> Option<u64> {
+        i.output_blinding.get(&vout).copied().or(i.static_blinding)
+    }
+
+    #[test]
+    fn per_vout_beats_the_shared_value() {
+        let i = info(Some(7), &[(0, 11), (1, 22)]);
+        assert_eq!(chosen(&i, 0), Some(11));
+        assert_eq!(chosen(&i, 1), Some(22));
+        assert_ne!(
+            chosen(&i, 0),
+            chosen(&i, 1),
+            "two payload outputs must not share a blinding — that is the leak this field closes"
+        );
+    }
+
+    #[test]
+    fn a_partial_map_falls_back_per_vout_not_wholesale() {
+        // Only vout 1 is given its own; vout 0 keeps the shared value. The fallback is per-OUTPUT,
+        // so a caller can separate the legs that need it without restating the rest.
+        let i = info(Some(7), &[(1, 22)]);
+        assert_eq!(chosen(&i, 0), Some(7));
+        assert_eq!(chosen(&i, 1), Some(22));
+    }
+
+    #[test]
+    fn an_empty_map_leaves_existing_callers_exactly_as_they_were() {
+        let i = info(Some(7), &[]);
+        assert_eq!(chosen(&i, 0), Some(7));
+        assert_eq!(chosen(&i, 1), Some(7));
+        // …and with neither, the seal is random — the pre-existing default.
+        let r = info(None, &[]);
+        assert_eq!(chosen(&r, 0), None);
     }
 }
