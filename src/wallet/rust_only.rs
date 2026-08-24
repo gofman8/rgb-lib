@@ -694,7 +694,20 @@ impl Wallet {
             for builder_seal in beneficiaries {
                 match builder_seal {
                     BuilderSeal::Revealed(seal) => {
-                        let explicit_seal = ExplicitSeal::with(witness_txid, seal.vout);
+                        // [FOREIGN-REVEALED] Use the seal's OWN txid when it names one, and the
+                        // witness txid only when the seal is `TxPtr::WitnessTx`. This mirrors
+                        // `ExposedSeal::with_witness_id` = `self.txid().or(witness_id)`.
+                        //
+                        // Hardcoding `witness_txid` here silently rewrote a seal that named an
+                        // already-existing outpoint into `(witness_txid, that_seal's_vout)` — an
+                        // outpoint belonging to nothing, which surfaced as "outpoint … is not part
+                        // of the contract" from `consign`. Harmless while every revealed seal was a
+                        // witness vout; wrong the moment one is not.
+                        let seal_txid = match seal.txid {
+                            TxPtr::Txid(t) => t,
+                            TxPtr::WitnessTx => witness_txid,
+                        };
+                        let explicit_seal = ExplicitSeal::with(seal_txid, seal.vout);
                         beneficiaries_witness.push(explicit_seal);
                     }
                     BuilderSeal::Concealed(secret_seal) => {
@@ -800,7 +813,7 @@ impl Wallet {
             .expect("failure importing validated contract");
 
         let received_rgb_assignments =
-            self.extract_received_assignments(&consignment, witness_id, Some(vout), None);
+            self.extract_received_assignments(&consignment, witness_id, Some(vout), None, None);
 
         runtime.accept_transfer(valid_consignment, &resolver)?;
 
@@ -831,6 +844,92 @@ impl Wallet {
     /// `offchain_txids` is served from the consignment's own bundled witnesses
     /// (`docs/utexo/CTESR-GATE.md` §3.3).
     #[cfg(any(feature = "electrum", feature = "esplora"))]
+    /// [FOREIGN-REVEALED] Accept a consignment whose beneficiary seals are REVEALED foreign
+    /// outpoints — outpoints this wallet already owns, named in the clear.
+    ///
+    /// There is nothing to reveal: a revealed seal travels whole inside the consignment, so unlike
+    /// [`Self::accept_offchain_ladder`] this performs **no** `store_secret_seal`. That is the point —
+    /// the receiver needs no pre-shared secret and no reveal round, and the accept paths' hard-wired
+    /// `GraphSeal::with_blinded_vout` (which can only ever name `TxPtr::WitnessTx`) is bypassed
+    /// rather than extended.
+    ///
+    /// `carrier` is the receiver's own `("txid", vout)` that the transition assigned to, used only to
+    /// extract what was received.
+    pub fn accept_offchain_revealed(
+        &mut self,
+        consignment: RgbTransfer,
+        offchain_txids: &[String],
+        carrier: (String, u32),
+    ) -> Result<Vec<Assignment>, Error> {
+        info!(self.logger(), "Accepting offchain REVEALED transfer...");
+        let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
+        self.check_schema_support(&asset_schema)?;
+
+        let offchain_witness_ids = offchain_txids
+            .iter()
+            .map(|t| RgbTxid::from_str(t).map_err(|_| Error::InvalidTxid))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let witness_for_bundle = *offchain_witness_ids
+            .first()
+            .ok_or_else(|| Error::Internal { details: s!("no offchain witness supplied") })?;
+
+        let mut runtime = self.rgb_runtime()?;
+
+        let resolver = OffchainResolver {
+            offchain_witness_ids,
+            consignment: &consignment,
+            fallback: self.blockchain_resolver(),
+        };
+        let trusted_typesystem = asset_schema.types();
+        let validation_config = ValidationConfig {
+            chain_net: self.chain_net(),
+            trusted_typesystem,
+            ..Default::default()
+        };
+        let valid_consignment = match consignment.clone().validate(&resolver, &validation_config) {
+            Ok(c) => c,
+            Err(ValidationError::InvalidConsignment(e)) => {
+                error!(self.logger(), "Revealed consignment is invalid: {}", e);
+                return Err(Error::InvalidConsignment);
+            }
+            Err(ValidationError::ResolverError(e)) => {
+                return Err(Error::Network {
+                    details: e.to_string(),
+                });
+            }
+        };
+
+        let valid_contract = valid_consignment.clone().into_valid_contract();
+        runtime
+            .import_contract(valid_contract, &resolver)
+            .map_err(|e| Error::Internal {
+                details: format!("failure importing validated revealed contract: {e}"),
+            })?;
+
+        let carrier_txid = RgbTxid::from_str(&carrier.0).map_err(|_| Error::InvalidTxid)?;
+        // The bundle is found by the WITNESS txid (the un-broadcast transaction), while the seal is
+        // matched by the CARRIER outpoint. Passing the carrier as the witness — as a first cut did —
+        // finds no bundle at all and silently reports zero received.
+        let received = self.extract_received_assignments(
+            &consignment,
+            witness_for_bundle,
+            None,
+            None,
+            Some((carrier_txid, carrier.1)),
+        );
+
+        runtime.accept_transfer(valid_consignment, &resolver)?;
+
+        info!(self.logger(), "Accept offchain REVEALED completed");
+        Ok(received.into_values().collect())
+    }
+
+    /// Accept an off-chain ladder consignment, revealing every tier seal first.
+    ///
+    /// The concealed-seal counterpart of [`Self::accept_offchain_revealed`]: each `(txid, vout,
+    /// blinding)` is turned into a `GraphSeal` and stored, which is what converts the consignment's
+    /// concealed assignments into allocations this wallet can later spend.
     pub fn accept_offchain_ladder(
         &mut self,
         consignment: RgbTransfer,
@@ -894,7 +993,7 @@ impl Wallet {
         let (leaf_txid, leaf_vout, _) = seals.last().expect("checked non-empty");
         let leaf_witness = RgbTxid::from_str(leaf_txid).map_err(|_| Error::InvalidTxid)?;
         let received =
-            self.extract_received_assignments(&consignment, leaf_witness, Some(*leaf_vout), None);
+            self.extract_received_assignments(&consignment, leaf_witness, Some(*leaf_vout), None, None);
 
         runtime.accept_transfer(valid_consignment, &resolver)?;
 
@@ -942,7 +1041,7 @@ impl Wallet {
         };
         let witness_id = RgbTxid::from_str(witness_txid).map_err(|_| Error::InvalidTxid)?;
         let received =
-            self.extract_received_assignments(&consignment, witness_id, Some(vout), None);
+            self.extract_received_assignments(&consignment, witness_id, Some(vout), None, None);
         // Count ONLY the spendable fungible balance. An InflationRight is the *right to mint* more
         // supply, not spendable tokens — booking it as received balance would let a sender who holds
         // an inflation right hand the receiver a consignment that inflates their apparent balance out

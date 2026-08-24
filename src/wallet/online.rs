@@ -752,6 +752,11 @@ pub trait WalletOnline: WalletOffline {
         witness_id: RgbTxid,
         vout: Option<u32>,
         known_concealed: Option<SecretSeal>,
+        // [FOREIGN-REVEALED] An outpoint this wallet ALREADY owns that the transition assigned to in
+        // the clear. Matched on the seal's OWN txid, because such a seal is `TxPtr::Txid(carrier)`
+        // and never `TxPtr::WitnessTx` — the arm below would otherwise skip it and report zero
+        // received while the consignment validated perfectly, which is exactly what it did.
+        known_revealed_foreign: Option<(RgbTxid, u32)>,
     ) -> HashMap<Opout, Assignment> {
         let mut received = HashMap::new();
         if let Some(bundle) = consignment
@@ -766,6 +771,22 @@ pub trait WalletOnline: WalletOffline {
                         let opout = Opout::new(*opid, *ass_type, no as u16);
                         if let Assign::ConfidentialSeal { seal, state, .. } = fungible_assignment
                             && Some(*seal) == known_concealed
+                        {
+                            match *ass_type {
+                                OS_ASSET => {
+                                    received.insert(opout, Assignment::Fungible(state.as_u64()));
+                                }
+                                OS_INFLATION => {
+                                    received
+                                        .insert(opout, Assignment::InflationRight(state.as_u64()));
+                                }
+                                _ => {}
+                            }
+                        };
+                        if let Assign::Revealed { seal, state, .. } = fungible_assignment
+                            && let Some((f_txid, f_vout)) = known_revealed_foreign
+                            && seal.txid == TxPtr::Txid(f_txid)
+                            && seal.vout.into_u32() == f_vout
                         {
                             match *ass_type {
                                 OS_ASSET => {
@@ -1280,7 +1301,7 @@ pub trait WalletOnline: WalletOffline {
             None
         };
         let receiving =
-            self.extract_received_assignments(&consignment, witness_id, vout, known_concealed);
+            self.extract_received_assignments(&consignment, witness_id, vout, known_concealed, None);
         if receiving.is_empty() {
             error!(self.logger(), "Cannot find any receiving assignment");
             return self.refuse_consignment(
