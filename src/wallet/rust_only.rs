@@ -4,6 +4,9 @@
 
 use super::*;
 use rgbstd::Operation as _;
+// [FOREIGN-REVEALED] `TxPtr::Txid` is the seal variant that names an ALREADY-EXISTING outpoint,
+// as opposed to `TxPtr::WitnessTx` which resolves to the transaction being coloured.
+use rgbstd::rgbcore::seals::txout::TxPtr;
 
 /// RGB asset-specific information to color a transaction
 #[derive(Debug, Clone)]
@@ -16,6 +19,20 @@ pub struct AssetColoringInfo {
     /// a receiver's existing UTXO (e.g. a statechain UTXO) or route change to a free existing UTXO,
     /// so a transfer can consume a statechain UTXO and send change back to another statechain UTXO.
     pub blinded_map: HashMap<String, u64>,
+    /// Map of `"txid:vout"` (an outpoint the RECEIVER already owns) to asset amount, assigned as a
+    /// **REVEALED** foreign seal — `BlindSeal { txid: TxPtr::Txid(..), vout, blinding }` — rather than
+    /// a concealed one.
+    ///
+    /// Same economic effect as [`Self::blinded_map`]: the allocation lands on an outpoint that already
+    /// exists, so the sender does NOT have to fund a fresh carrier output for the receiver. The
+    /// difference is privacy for correctness: the outpoint is named in the clear, which costs the
+    /// receiver's anonymity toward the sender but keeps the assignment on the REVEALED validator path
+    /// (`Assign::Revealed`), where `index_transition_assignments` indexes foreign outpoints and
+    /// `with_witness_id` = `self.txid().or(witness_id)` resolves the seal to the carrier txid.
+    ///
+    /// It also removes a reveal step: a revealed seal travels whole in the consignment, so the
+    /// receiver needs no pre-stored secret and no `store_secret_seal`/reveal round.
+    pub revealed_map: HashMap<String, u64>,
     /// Static blinding to keep the transaction construction deterministic.
     ///
     /// ⚠️ **ONE value for EVERY vout.** That is fine for a single-payload transaction and is a
@@ -559,6 +576,45 @@ impl Wallet {
                     AssetSchema::Uda => {
                         return Err(Error::InvalidColoringInfo {
                             details: s!("blinded beneficiaries are not supported for UDA in this path"),
+                        });
+                    }
+                }
+            }
+
+            // [FOREIGN-REVEALED] Assign to an outpoint the receiver ALREADY owns, named in the clear.
+            // Economically identical to the blinded arm — no fresh carrier for the sender to fund —
+            // but it stays on the REVEALED validator path, which is the one the witness lane already
+            // exercises green.
+            for (outpoint_str, amount) in asset_coloring_info.revealed_map.clone() {
+                if amount == 0 {
+                    continue;
+                }
+                let (txid_s, vout_s) = outpoint_str.split_once(':').ok_or_else(|| {
+                    Error::InvalidColoringInfo {
+                        details: format!("revealed_map key is not txid:vout: {outpoint_str}"),
+                    }
+                })?;
+                let txid = RgbTxid::from_str(txid_s).map_err(|_| Error::InvalidColoringInfo {
+                    details: format!("revealed_map key has an unparseable txid: {outpoint_str}"),
+                })?;
+                let vout: u32 = vout_s.parse().map_err(|_| Error::InvalidColoringInfo {
+                    details: format!("revealed_map key has an unparseable vout: {outpoint_str}"),
+                })?;
+                sending_amt += amount;
+                let graph_seal = GraphSeal::new_random(TxPtr::Txid(txid), vout);
+                let seal: BuilderSeal<GraphSeal> = BuilderSeal::Revealed(graph_seal);
+                beneficiaries.push(seal);
+                match schema {
+                    AssetSchema::Nia | AssetSchema::Cfa | AssetSchema::Ifa => {
+                        asset_transition_builder = asset_transition_builder.add_fungible_state(
+                            assignment_name.clone(),
+                            seal,
+                            amount,
+                        )?;
+                    }
+                    AssetSchema::Uda => {
+                        return Err(Error::InvalidColoringInfo {
+                            details: s!("UDA is not supported on the revealed-foreign lane"),
                         });
                     }
                 }
@@ -1320,6 +1376,7 @@ impl Wallet {
             asset_info_map: HashMap::from([(
                 contract,
                 AssetColoringInfo {
+                    revealed_map: HashMap::new(),
                     output_map: HashMap::from([(0u32, rgb_amount)]),
                     blinded_map: HashMap::new(),
                     static_blinding: Some(blinding),
